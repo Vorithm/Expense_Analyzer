@@ -60,7 +60,7 @@ with tab1:
             with st.spinner("Processing your data..."):
                 files = {'file': uploaded_file}
                 try:
-                    response = requests.post("https://expense-analyzer-d961.onrender.com/api/upload_csv", files=files)
+                    response = requests.post("http://localhost:5001/api/upload_csv", files=files)
                     if response.status_code == 200:
                         result = response.json()
                         st.success(f"✅ {result['message']}")
