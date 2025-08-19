@@ -3,7 +3,17 @@ import pandas as pd
 import plotly.express as px
 import matplotlib.pyplot as plt
 import re
-
+from io import BytesIO
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import Paragraph, Frame, Spacer, Image as RLImage, Table, TableStyle
+from reportlab.lib import colors
+import matplotlib 
+matplotlib.use("Agg")  # headless backend
+import base64
 
 # ==============================================================================
 # BACKEND LOGIC
@@ -143,6 +153,290 @@ def backend_get_expense_summary_df():
     summary.rename(columns={'Display_Category':'Category'}, inplace=True)
     return summary.sort_values('Amount', ascending=False)
 
+def build_insights(df: pd.DataFrame):
+    if df.empty:
+        return {
+            "period": ("N/A", "N/A"),
+            "total_income": 0.0,
+            "total_expense": 0.0,
+            "net_amount": 0.0,
+            "top_categories": [],
+            "highest_month": None,
+            "moM": pd.Series(dtype=float),
+            "moM_changes": [],
+            "category_spikes": [],
+            "category_table": pd.DataFrame(columns=["Category","Amount","Share","Txns"]),
+            "top_other_sources": [],
+            "advice_lines": []
+        }
+
+    dfx = df.copy()
+    dfx["Date"] = pd.to_datetime(dfx["Date"], errors="coerce")
+    dfx = dfx.dropna(subset=["Date"])
+    period = (dfx["Date"].min().date(), dfx["Date"].max().date())
+
+    total_income = float(dfx[dfx["Amount"] > 0]["Amount"].sum())
+    total_expense = float(dfx[dfx["Amount"] < 0]["Amount"].abs().sum())
+    net_amount = float(dfx["Amount"].sum())
+
+    exp = dfx[dfx["Amount"] < 0].copy()
+    exp["AbsAmount"] = exp["Amount"].abs()
+
+    # Category totals
+    cat_sum = exp.groupby("Category", dropna=False)["AbsAmount"].agg(["sum","count"]).reset_index()
+    cat_sum = cat_sum.sort_values("sum", ascending=False)
+    total_expense_safe = float(cat_sum["sum"].sum()) if not cat_sum.empty else 0.0
+    cat_sum["share"] = (cat_sum["sum"] / total_expense_safe * 100).round(1) if total_expense_safe > 0 else 0.0
+    top_categories = cat_sum.head(5)[["Category","sum","share"]].values.tolist()
+
+    # Monthly totals with friendly labels (e.g., "Sep 2023")
+    if not exp.empty:
+        exp["Month"] = exp["Date"].dt.strftime("%b %Y")
+        month_totals = exp.groupby("Month")["AbsAmount"].sum().sort_index(key=lambda x: pd.to_datetime(x, format="%b %Y"))
+        highest_month = (month_totals.idxmax(), float(month_totals.max())) if not month_totals.empty else None
+
+        mom = month_totals.pct_change().dropna().apply(lambda x: round(x*100, 1))
+        moM_changes = list(mom.items())
+
+        category_spikes = []
+        months_sorted = month_totals.index.tolist()
+        if len(months_sorted) >= 2:
+            last_m, prev_m = months_sorted[-1], months_sorted[-2]
+            last_df = exp[exp["Month"] == last_m].groupby("Category")["AbsAmount"].sum()
+            prev_df = exp[exp["Month"] == prev_m].groupby("Category")["AbsAmount"].sum()
+            cats = set(last_df.index) | set(prev_df.index)
+            for c in cats:
+                last_v = float(last_df.get(c, 0.0))
+                prev_v = float(prev_df.get(c, 0.0))
+                if prev_v == 0 and last_v > 0:
+                    change = 100.0
+                elif prev_v == 0 and last_v == 0:
+                    change = 0.0
+                else:
+                    change = round(((last_v - prev_v) / prev_v) * 100, 1)
+                category_spikes.append((c, change, last_v, prev_v))
+            category_spikes.sort(key=lambda x: x[1], reverse=True)
+            category_spikes = category_spikes[:3]
+        else:
+            category_spikes = []
+    else:
+        month_totals = pd.Series(dtype=float)
+        highest_month = None
+        moM_changes = []
+        category_spikes = []
+
+    # Top contributors inside "Other"
+    top_other_sources = []
+    if "Other" in cat_sum["Category"].astype(str).values:
+        other_df = exp[exp["Category"] == "Other"].copy()
+        if not other_df.empty:
+            if "Name" in other_df.columns:
+                src = other_df.groupby("Name")["AbsAmount"].sum().sort_values(ascending=False).head(3)
+                top_other_sources = [(k, float(v)) for k, v in src.items()]
+            else:
+                src = (other_df
+                       .assign(DescShort=other_df["Description"].astype(str).str.slice(0,30))
+                       .groupby("DescShort")["AbsAmount"].sum()
+                       .sort_values(ascending=False).head(3))
+                top_other_sources = [(k, float(v)) for k, v in src.items()]
+
+    # Advice lines (journal-like)
+    advice = []
+    if cat_sum.shape[0] > 0:
+        top_cat = str(cat_sum.iloc[0]["Category"])
+        top_amt = float(cat_sum.iloc[0]["sum"])
+        top_share = float(cat_sum.iloc[0]["share"])
+        advice.append(f"Watch {top_cat}: it took {top_share:.1f}% of expenses. Try a gentle cap next month.")
+        suggested_cap = max(0, top_amt * 0.9)
+        advice.append(f"Set a soft cap of INR {suggested_cap:,.0f} for {top_cat}.")
+    if highest_month:
+        advice.append(f"Peak month was {highest_month[0]}. Plan non-urgent buys outside peak weeks next month.")
+    if total_income > 0:
+        savings_rate = max(0.0, (total_income - total_expense) / total_income) * 100
+        advice.append(f"Estimated savings rate: {savings_rate:.1f}%. Aim for +5% next month.")
+    if top_other_sources:
+        names = ", ".join([n for n,_ in top_other_sources])
+        advice.append(f"'Other' is mainly from: {names}. Consider recategorizing or trimming these.")
+
+    cat_table = pd.DataFrame({
+        "Category": cat_sum["Category"].astype(str),
+        "Amount": cat_sum["sum"].astype(float),
+        "Share": cat_sum["share"].astype(float),
+        "Txns": cat_sum["count"].astype(int)
+    })
+
+    return {
+        "period": period,
+        "total_income": total_income,
+        "total_expense": total_expense,
+        "net_amount": net_amount,
+        "top_categories": top_categories,
+        "highest_month": highest_month,
+        "moM": month_totals,
+        "moM_changes": moM_changes,
+        "category_spikes": category_spikes,
+        "category_table": cat_table,
+        "top_other_sources": top_other_sources,
+        "advice_lines": advice
+    }
+
+
+def fig_to_png_bytes(fig, dpi=140):
+    bio = BytesIO()
+    fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    bio.seek(0)
+    return bio
+
+
+def make_top_categories_chart(cat_table: pd.DataFrame):
+    if cat_table.empty:
+        return None
+    dfp = cat_table.head(5)
+    fig, ax = plt.subplots(figsize=(5.2, 3.2), facecolor="white")
+    ax.barh(dfp["Category"][::-1], dfp["Amount"][::-1], color="#1f77b4")
+    ax.set_xlabel("Amount (INR)")
+    ax.set_title("Top Categories")
+    ax.grid(axis="x", alpha=0.25)
+    for i, v in enumerate(dfp["Amount"][::-1].values):
+        ax.text(v, i, f"  {int(v):,}", va="center", fontsize=8)
+    fig.tight_layout()
+    return fig_to_png_bytes(fig)
+
+
+def make_monthly_expenses_chart(moM_series: pd.Series):
+    if moM_series is None or moM_series.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(5.2, 3.2), facecolor="white")
+    ax.plot(moM_series.index, moM_series.values, marker="o", color="#ff7f0e")
+    ax.set_title("Monthly Expenses")
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Amount (INR)")
+    ax.grid(alpha=0.25)
+    plt.xticks(rotation=30, ha="right")
+    fig.tight_layout()
+    return fig_to_png_bytes(fig)
+
+
+def generate_pdf_summary(df: pd.DataFrame) -> bytes:
+    insights = build_insights(df)
+
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("Title", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=18, spaceAfter=6)
+    h_style = ParagraphStyle("Header", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=13, spaceBefore=8, spaceAfter=4)
+    p_style = ParagraphStyle("Body", parent=styles["BodyText"], fontName="Helvetica", fontSize=10, leading=13)
+    small_style = ParagraphStyle("Small", parent=styles["BodyText"], fontName="Helvetica", fontSize=9, textColor=colors.grey)
+
+    frame_margin = 1.5*cm
+    frame = Frame(frame_margin, frame_margin, width-3*cm, height-3*cm, showBoundary=0)
+    elements = []
+
+    # Header
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    elements.append(Paragraph("Expense Journal — Monthly Summary", title_style))
+    period_start, period_end = insights["period"]
+    elements.append(Paragraph(f"Generated on: {today_str}", small_style))
+    elements.append(Paragraph(f"Period: {period_start} to {period_end}", small_style))
+    elements.append(Spacer(1, 8))
+
+    # Key Metrics
+    elements.append(Paragraph("Key Metrics", h_style))
+    km_text = (
+        f"Total Income: INR {insights['total_income']:,.2f}<br/>"
+        f"Total Expenses: INR {insights['total_expense']:,.2f}<br/>"
+        f"Net Amount: INR {insights['net_amount']:,.2f}"
+    )
+    elements.append(Paragraph(km_text, p_style))
+    elements.append(Spacer(1, 6))
+
+    # Guidance (journal-like)
+    if insights["advice_lines"]:
+        elements.append(Paragraph("Quick Guidance", h_style))
+        elements.append(Paragraph("<br/>".join(f"• {ln}" for ln in insights["advice_lines"]), p_style))
+        elements.append(Spacer(1, 6))
+
+    # Top Categories list
+    elements.append(Paragraph("Top Spending Categories", h_style))
+    if insights["top_categories"]:
+        lines = []
+        for i, (cat, amt, share) in enumerate(insights["top_categories"], start=1):
+            lines.append(f"{i}) {cat} — INR {amt:,.0f} ({share:.1f}%)")
+        elements.append(Paragraph("<br/>".join(lines), p_style))
+    else:
+        elements.append(Paragraph("No expense categories found.", p_style))
+    elements.append(Spacer(1, 6))
+
+    # Monthly Highlights with spikes
+    elements.append(Paragraph("Monthly Highlights", h_style))
+    mh_lines = []
+    if insights["highest_month"]:
+        m, v = insights["highest_month"]
+        mh_lines.append(f"Highest spending month: {m} — INR {v:,.0f}.")
+    if insights["category_spikes"]:
+        for cat, change, last_v, prev_v in insights["category_spikes"]:
+            direction = "higher" if change >= 0 else "lower"
+            mh_lines.append(
+                f"{cat}: {abs(change):.1f}% {direction} vs previous month (INR {last_v:,.0f} vs INR {prev_v:,.0f})."
+            )
+    if not mh_lines:
+        mh_lines.append("No notable month-over-month changes detected.")
+    elements.append(Paragraph("<br/>".join(mh_lines), p_style))
+    elements.append(Spacer(1, 8))
+
+    # Charts (clean white)
+    cat_chart = make_top_categories_chart(insights["category_table"])
+    moM_chart = make_monthly_expenses_chart(insights.get("moM"))
+    chart_imgs = []
+    if cat_chart:
+        chart_imgs.append(RLImage(cat_chart, width=7*cm, height=4.5*cm))
+    if moM_chart:
+        chart_imgs.append(RLImage(moM_chart, width=7*cm, height=4.5*cm))
+    if chart_imgs:
+        if len(chart_imgs) == 2:
+            table = Table([[chart_imgs[0], chart_imgs[1]]], colWidths=[7.5*cm, 7.5*cm])
+        else:
+            table = Table([[chart_imgs[0]]], colWidths=[15*cm])
+        table.setStyle(TableStyle([("ALIGN", (0,0), (-1,-1), "CENTER")]))
+        elements.append(table)
+        elements.append(Spacer(1, 8))
+
+    # Category breakdown table (top 6 for compact layout)
+    elements.append(Paragraph("Category Breakdown", h_style))
+    cat_tbl = insights["category_table"].copy()
+    if not cat_tbl.empty:
+        cat_tbl["Amount"] = cat_tbl["Amount"].apply(lambda x: f"INR {x:,.0f}")
+        cat_tbl["Share"] = cat_tbl["Share"].apply(lambda x: f"{x:.1f}%")
+        data = [["Category", "Total", "Share", "Txns"]] + cat_tbl.head(6).values.tolist()
+        t = Table(data, colWidths=[7*cm, 3*cm, 2*cm, 2*cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f7f9fb")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#111111")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,0), 10),
+            ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+            ("ALIGN", (0,0), (0,-1), "LEFT"),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#e5e7eb")),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#fcfdff")]),
+        ]))
+        elements.append(t)
+    else:
+        elements.append(Paragraph("No expenses to display.", p_style))
+
+    # Footer note
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph("Tip: Set weekly limits for top categories and track progress mid-month.", small_style))
+
+    frame.addFromList(elements, c)
+    c.showPage()
+    c.save()
+
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
 
 # ==============================================================================
 # FRONTEND UI
@@ -248,8 +542,8 @@ if st.session_state.data_updated or st.button("🔄 Refresh Data"):
                 category_df['Amount (₹)'] = category_df['Amount'].apply(lambda x: f"₹{x:,.2f}")
                 category_df['Percentage'] = category_df['Percentage'].apply(lambda x: f"{x:.1f}%")
                 st.dataframe(category_df[['Category','Amount (₹)','Percentage','Transaction_Count']], use_container_width=True, hide_index=True)
-
-
+             
+                
             st.header("✏ Manual Categorization")
             other_df = backend_get_other_df()
             if other_df.empty:
@@ -400,6 +694,21 @@ if st.session_state.data_updated or st.button("🔄 Refresh Data"):
             st.write(daily_expenses)
             st.line_chart(daily_expenses)
             
+            if 'df_global' in st.session_state and st.session_state.df_global is not None:
+                df_for_pdf = st.session_state.df_global.copy()
+                try:
+                    pdf_bytes = generate_pdf_summary(df_for_pdf)
+                    st.download_button(
+                        label="📄 Download PDF Summary",
+                        data=pdf_bytes,
+                        file_name=f"expense_journal_{datetime.now().strftime('%Y%m%d')}.pdf",
+                        mime="application/pdf",
+                        type="primary",
+                        help="Download a clean monthly spending journal with highlights and charts"
+                    )
+                except Exception as e:
+                    st.error(f"Failed to generate PDF: {e}")
+                        
             
             TIPS = [
                 "💰 Save a little before you start spending.", 
@@ -576,4 +885,3 @@ Format 1: Standard — Date, Description, Amount
 Format 2: Bank Statement — Date, Narration, Withdrawal Amt., Deposit Amt.
 Note: The app handles both formats automatically.
 """)
-
