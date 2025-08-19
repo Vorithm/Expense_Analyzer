@@ -2,4 +2,5 @@ streamlit
 datetime
 plotly
 flask
+reportlab
 matplotlib
